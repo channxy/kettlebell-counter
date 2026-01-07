@@ -47,6 +47,8 @@ class FailureReason:
     # Technical issues
     IMPROPER_CATCH = "improper_catch"
     DOUBLE_BOUNCE = "double_bounce"
+    SEGMENTED_PULL = "segmented_pull"  # Velocity dropped before reaching overhead
+    JERKY_MOVEMENT = "jerky_movement"  # Non-smooth trajectory
     
     # Detection issues (for ambiguous)
     LOW_POSE_CONFIDENCE = "low_pose_confidence"
@@ -68,6 +70,8 @@ class FailureReason:
             cls.INCOMPLETE_EXTENSION,
             cls.IMPROPER_CATCH,
             cls.DOUBLE_BOUNCE,
+            cls.SEGMENTED_PULL,
+            cls.JERKY_MOVEMENT,
             cls.LOW_POSE_CONFIDENCE,
             cls.OCCLUDED_KEYPOINTS,
             cls.UNCLEAR_MOVEMENT,
@@ -89,6 +93,8 @@ class FailureReason:
             cls.INCOMPLETE_EXTENSION: "Full extension was not achieved",
             cls.IMPROPER_CATCH: "Catch phase was not executed properly",
             cls.DOUBLE_BOUNCE: "Multiple bounces detected in rack position",
+            cls.SEGMENTED_PULL: "Velocity stopped before reaching overhead (segmented pull)",
+            cls.JERKY_MOVEMENT: "Movement trajectory was not smooth",
             cls.LOW_POSE_CONFIDENCE: "Pose detection confidence was too low",
             cls.OCCLUDED_KEYPOINTS: "Key body points were not visible",
             cls.UNCLEAR_MOVEMENT: "Movement pattern could not be clearly identified",

@@ -146,6 +146,7 @@ async def get_workout(
         thumbnail_path=workout.thumbnail_path,
         notes=workout.notes,
         perceived_effort=workout.perceived_effort,
+        mood=workout.mood,
         analytics_summary=workout.analytics_summary,
         rep_attempts=rep_responses,
         timeline=timeline,
@@ -244,12 +245,16 @@ async def get_workout_no_reps(
 @router.patch("/{workout_id}")
 async def update_workout(
     workout_id: str,
-    notes: str = None,
-    perceived_effort: int = None,
+    notes: str = Query(None),
+    perceived_effort: int = Query(None),
+    mood: str = Query(None),
+    workout_date: str = Query(None),
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Update workout notes and perceived effort (RPE)."""
+    """Update workout notes, perceived effort (RPE), mood, and date."""
+    from datetime import datetime as dt
+    
     result = await db.execute(
         select(Workout).where(
             Workout.id == workout_id,
@@ -273,13 +278,33 @@ async def update_workout(
                 detail="Perceived effort must be between 1 and 10"
             )
         workout.perceived_effort = perceived_effort
+    if mood is not None:
+        valid_moods = ["great", "good", "okay", "tired", "heavy"]
+        if mood and mood not in valid_moods:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Mood must be one of: {valid_moods}"
+            )
+        workout.mood = mood
+    if workout_date is not None:
+        try:
+            parsed_date = dt.fromisoformat(workout_date.replace('Z', '+00:00'))
+            workout.workout_date = parsed_date
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid date format"
+            )
     
     await db.commit()
+    await db.refresh(workout)
     
     return {
         "id": workout.id,
         "notes": workout.notes,
         "perceived_effort": workout.perceived_effort,
+        "mood": workout.mood,
+        "workout_date": workout.workout_date.isoformat() if workout.workout_date else None,
         "message": "Workout updated successfully"
     }
 

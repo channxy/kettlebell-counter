@@ -155,19 +155,19 @@ export function NoRepList({ noReps, onSeek, className }: NoRepListProps) {
                             Metrics:
                           </div>
                           <div className="grid grid-cols-2 gap-2 text-xs">
-                            {rep.metrics.lockout_angle && (
+                            {rep.metrics?.lockout_angle && (
                               <div>
                                 <span className="text-kb-muted">Lockout: </span>
                                 <span className="text-white">
-                                  {rep.metrics.lockout_angle.min_angle?.toFixed(1)}°
+                                  {(rep.metrics.lockout_angle.min_angle ?? 0).toFixed(1)}°
                                 </span>
                               </div>
                             )}
-                            {rep.metrics.tempo_ms && (
+                            {rep.metrics?.tempo_ms != null && (
                               <div>
                                 <span className="text-kb-muted">Tempo: </span>
                                 <span className="text-white">
-                                  {rep.metrics.tempo_ms.toFixed(0)}ms
+                                  {(rep.metrics.tempo_ms ?? 0).toFixed(0)}ms
                                 </span>
                               </div>
                             )}

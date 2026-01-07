@@ -106,6 +106,7 @@ class Workout(Base, TimestampMixin):
     # User workout log/notes
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     perceived_effort: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # RPE 1-10
+    mood: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)  # How user felt: great, good, okay, tired, heavy
     
     @property
     def analytics_summary(self) -> Optional[dict]:

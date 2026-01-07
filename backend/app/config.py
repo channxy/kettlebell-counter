@@ -35,19 +35,24 @@ class Settings(BaseSettings):
     # Video Processing
     max_video_duration_minutes: int = 60
     max_video_size_mb: int = 5000  # 5GB
-    processing_fps: float = 6.0  # Reduced from 12 - 6fps is enough for kettlebell movements
+    processing_fps: float = 15.0  # 15 FPS optimal for kettlebell - captures hand insertion phase
     processing_frame_width: int = 640  # Resize frames for faster processing (0 = no resize)
     
+    # Video Quality Thresholds
+    min_video_fps: float = 24.0  # Minimum acceptable source FPS
+    min_blur_score: float = 100.0  # Laplacian variance threshold for blur detection
+    min_athlete_height_ratio: float = 0.50  # Athlete must be at least 50% of frame height
+    
     # Pose Estimation
-    pose_confidence_threshold: float = 0.6
-    ambiguous_confidence_threshold: float = 0.4
+    pose_confidence_threshold: float = 0.5  # Slightly relaxed for real-world videos
+    ambiguous_confidence_threshold: float = 0.35
     pose_model_complexity: int = 0  # 0=lite, 1=full, 2=heavy (0 is 3x faster)
     
-    # Rep Detection Thresholds
-    min_lockout_angle_degrees: float = 150.0  # Elbow angle for valid lockout (lowered from 165)
-    min_fixation_frames: int = 2  # Minimum frames at lockout (lowered from 3)
-    max_torso_lean_degrees: float = 25.0  # Allow more lean for snatch (raised from 15)
-    min_overhead_height_ratio: float = 0.70  # KB height relative to body (lowered from 0.85)
+    # Rep Detection Thresholds - COMPETITION ACCURATE
+    min_lockout_angle_degrees: float = 165.0  # Competition standard: near full extension
+    min_fixation_frames: int = 4  # ~250ms at 15fps - competition requires visible pause
+    max_torso_lean_degrees: float = 20.0  # Competition limit for jerk/LC
+    min_overhead_height_ratio: float = 0.75  # Wrist must be clearly above head level
     
     class Config:
         env_file = ".env"

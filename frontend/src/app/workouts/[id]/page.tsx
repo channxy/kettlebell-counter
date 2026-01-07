@@ -9,8 +9,6 @@ import {
   ArrowLeft,
   Clock,
   Calendar,
-  Film,
-  Heart,
   Loader2,
   Timer,
   Trash2,
@@ -19,23 +17,43 @@ import {
   CheckCircle,
   XCircle,
   Edit3,
+  Smile,
+  Frown,
+  Meh,
+  Battery,
+  BatteryLow,
+  X,
+  Check,
 } from "lucide-react";
 import Link from "next/link";
 
-import { workoutApi, healthApi, RepAttempt } from "@/lib/api";
+import { workoutApi, RepAttempt } from "@/lib/api";
 import { RepCounter } from "@/components/RepCounter";
 import { VideoTimeline } from "@/components/VideoTimeline";
 import { NoRepList } from "@/components/NoRepList";
 import { cn, formatDuration, getLiftTypeLabel } from "@/lib/utils";
 
-function ProcessingTimer({ createdAt }: { createdAt: string }) {
+// Mood options with icons and colors
+const MOOD_OPTIONS = [
+  { value: "great", label: "Great", icon: Smile, color: "text-green-400", bg: "bg-green-400" },
+  { value: "good", label: "Good", icon: Smile, color: "text-lime-400", bg: "bg-lime-400" },
+  { value: "okay", label: "Okay", icon: Meh, color: "text-yellow-400", bg: "bg-yellow-400" },
+  { value: "tired", label: "Tired", icon: BatteryLow, color: "text-orange-400", bg: "bg-orange-400" },
+  { value: "heavy", label: "Heavy Day", icon: Frown, color: "text-red-400", bg: "bg-red-400" },
+];
+
+function ProcessingTimer({ startedAt }: { startedAt: string | null }) {
   const [elapsed, setElapsed] = useState("0:00");
 
   useEffect(() => {
-    // Parse timestamp - treat as UTC if no timezone specified
-    const timestamp = createdAt.includes('Z') || createdAt.includes('+') 
-      ? createdAt 
-      : createdAt + 'Z';
+    if (!startedAt) {
+      setElapsed("0:00");
+      return;
+    }
+
+    const timestamp = startedAt.includes('Z') || startedAt.includes('+') 
+      ? startedAt 
+      : startedAt + 'Z';
     const start = new Date(timestamp).getTime();
     
     const updateTimer = () => {
@@ -49,7 +67,16 @@ function ProcessingTimer({ createdAt }: { createdAt: string }) {
     updateTimer();
     const interval = setInterval(updateTimer, 1000);
     return () => clearInterval(interval);
-  }, [createdAt]);
+  }, [startedAt]);
+
+  if (!startedAt) {
+    return (
+      <div className="flex items-center gap-2 text-kb-muted">
+        <Timer className="w-5 h-5" />
+        <span className="text-xl font-mono font-semibold">Waiting...</span>
+      </div>
+    );
+  }
 
   return (
     <div className="flex items-center gap-2 text-kb-warning">
@@ -146,8 +173,11 @@ export default function WorkoutDetailPage() {
 
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [isEditingNotes, setIsEditingNotes] = useState(false);
+  const [isEditingDate, setIsEditingDate] = useState(false);
   const [notes, setNotes] = useState("");
   const [perceivedEffort, setPerceivedEffort] = useState<number | null>(null);
+  const [mood, setMood] = useState<string | null>(null);
+  const [editedDate, setEditedDate] = useState("");
 
   const {
     data: workout,
@@ -172,15 +202,19 @@ export default function WorkoutDetailPage() {
     if (workout) {
       setNotes(workout.notes || "");
       setPerceivedEffort(workout.perceived_effort);
+      setMood(workout.mood);
+      setEditedDate(format(new Date(workout.workout_date), "yyyy-MM-dd"));
     }
   }, [workout]);
 
   const updateMutation = useMutation({
-    mutationFn: (data: { notes?: string; perceived_effort?: number }) =>
+    mutationFn: (data: { notes?: string; perceived_effort?: number; mood?: string; workout_date?: string }) =>
       workoutApi.update(workoutId, data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["workout", workoutId] });
+      queryClient.invalidateQueries({ queryKey: ["workouts"] });
       setIsEditingNotes(false);
+      setIsEditingDate(false);
     },
   });
 
@@ -199,9 +233,20 @@ export default function WorkoutDetailPage() {
     });
   };
 
+  const handleSaveDate = () => {
+    if (editedDate) {
+      updateMutation.mutate({ workout_date: new Date(editedDate).toISOString() });
+    }
+  };
+
   const handleRPEChange = (value: number) => {
     setPerceivedEffort(value);
     updateMutation.mutate({ perceived_effort: value });
+  };
+
+  const handleMoodChange = (value: string) => {
+    setMood(value);
+    updateMutation.mutate({ mood: value });
   };
 
   const noReps =
@@ -238,6 +283,8 @@ export default function WorkoutDetailPage() {
     workout.processing_status
   );
 
+  const selectedMood = MOOD_OPTIONS.find(m => m.value === mood);
+
   return (
     <div className="min-h-screen pb-12 bg-kb-bg">
       {/* Delete confirmation modal */}
@@ -267,23 +314,50 @@ export default function WorkoutDetailPage() {
                 <h1 className="font-display text-xl font-bold">
                   {getLiftTypeLabel(workout.lift_type)}
                 </h1>
-                <p className="text-sm text-kb-muted">
-                  {format(new Date(workout.workout_date), "EEEE, MMMM d, yyyy")}
-                </p>
+                {/* Editable Date */}
+                <div className="flex items-center gap-2">
+                  {isEditingDate ? (
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="date"
+                        value={editedDate}
+                        onChange={(e) => setEditedDate(e.target.value)}
+                        className="bg-kb-surface border border-kb-border rounded px-2 py-1 text-sm focus:outline-none focus:border-kb-accent"
+                      />
+                      <button
+                        onClick={handleSaveDate}
+                        disabled={updateMutation.isPending}
+                        className="p-1 hover:bg-kb-surface rounded text-kb-success"
+                      >
+                        <Check className="w-4 h-4" />
+                      </button>
+                      <button
+                        onClick={() => {
+                          setEditedDate(format(new Date(workout.workout_date), "yyyy-MM-dd"));
+                          setIsEditingDate(false);
+                        }}
+                        className="p-1 hover:bg-kb-surface rounded text-kb-danger"
+                      >
+                        <X className="w-4 h-4" />
+                      </button>
+                    </div>
+                  ) : (
+                    <>
+                      <p className="text-sm text-kb-muted">
+                        {format(new Date(workout.workout_date), "EEEE, MMMM d, yyyy")}
+                      </p>
+                      <button
+                        onClick={() => setIsEditingDate(true)}
+                        className="p-1 hover:bg-kb-surface rounded text-kb-muted hover:text-white"
+                      >
+                        <Edit3 className="w-3 h-3" />
+                      </button>
+                    </>
+                  )}
+                </div>
               </div>
             </div>
             <div className="flex items-center gap-2">
-              {workout.processing_status === "completed" &&
-                !workout.exported_to_health && (
-                  <motion.button
-                    whileHover={{ scale: 1.02 }}
-                    whileTap={{ scale: 0.98 }}
-                    className="btn-secondary flex items-center gap-2"
-                  >
-                    <Heart className="w-4 h-4" />
-                    Export to Health
-                  </motion.button>
-                )}
               <button
                 onClick={() => setShowDeleteModal(true)}
                 className="p-2 hover:bg-kb-danger/20 rounded-lg transition-colors text-kb-muted hover:text-kb-danger"
@@ -351,6 +425,38 @@ export default function WorkoutDetailPage() {
             </div>
           </div>
 
+          {/* Mood Selector */}
+          <div className="mt-6 pt-6 border-t border-kb-border">
+            <div className="flex items-center justify-between mb-3">
+              <span className="text-sm text-kb-muted">How did you feel?</span>
+              {selectedMood && (
+                <span className={cn("text-sm font-medium", selectedMood.color)}>
+                  {selectedMood.label}
+                </span>
+              )}
+            </div>
+            <div className="flex gap-2">
+              {MOOD_OPTIONS.map((option) => {
+                const Icon = option.icon;
+                return (
+                  <button
+                    key={option.value}
+                    onClick={() => handleMoodChange(option.value)}
+                    className={cn(
+                      "flex-1 flex flex-col items-center gap-1 p-3 rounded-lg transition-all",
+                      mood === option.value
+                        ? `${option.bg} text-white shadow-lg`
+                        : "bg-kb-surface hover:bg-kb-card text-kb-muted hover:text-white"
+                    )}
+                  >
+                    <Icon className="w-5 h-5" />
+                    <span className="text-xs">{option.label}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
           {/* RPE Selector */}
           <div className="mt-6 pt-6 border-t border-kb-border">
             <div className="flex items-center justify-between mb-3">
@@ -382,7 +488,7 @@ export default function WorkoutDetailPage() {
           {/* Notes Section */}
           <div className="mt-6 pt-6 border-t border-kb-border">
             <div className="flex items-center justify-between mb-3">
-              <span className="text-sm text-kb-muted">Workout Notes</span>
+              <span className="text-sm text-kb-muted">Workout Notes & Description</span>
               {!isEditingNotes && (
                 <button
                   onClick={() => setIsEditingNotes(true)}
@@ -427,7 +533,7 @@ export default function WorkoutDetailPage() {
                 </div>
               </div>
             ) : notes ? (
-              <p className="text-sm whitespace-pre-wrap">{notes}</p>
+              <p className="text-sm whitespace-pre-wrap bg-kb-surface rounded-lg p-4">{notes}</p>
             ) : (
               <p className="text-sm text-kb-muted italic">No notes yet. Click &quot;Add notes&quot; to record your thoughts.</p>
             )}
@@ -443,7 +549,7 @@ export default function WorkoutDetailPage() {
           >
             <div className="flex items-center justify-center gap-4 mb-6">
               <Loader2 className="w-10 h-10 animate-spin text-kb-accent" />
-              <ProcessingTimer createdAt={workout.created_at} />
+              <ProcessingTimer startedAt={workout.processing_started_at} />
             </div>
             <h2 className="font-display text-xl font-semibold mb-2">
               Analyzing Your Workout
@@ -539,71 +645,57 @@ export default function WorkoutDetailPage() {
                       <div className="flex justify-between text-sm mb-1">
                         <span className="text-kb-muted">Valid Rep Rate</span>
                         <span className="text-kb-success font-medium">
-                          {(workout.analytics_summary.valid_rep_rate * 100).toFixed(1)}%
+                          {((workout.analytics_summary?.valid_rep_rate ?? 0) * 100).toFixed(1)}%
                         </span>
                       </div>
                       <div className="h-2 bg-kb-surface rounded-full overflow-hidden">
                         <div
                           className="h-full bg-kb-success"
                           style={{
-                            width: `${workout.analytics_summary.valid_rep_rate * 100}%`,
+                            width: `${(workout.analytics_summary?.valid_rep_rate ?? 0) * 100}%`,
                           }}
                         />
                       </div>
                     </div>
 
                     {/* Tempo */}
-                    {workout.analytics_summary.tempo && (
+                    {workout.analytics_summary?.tempo && (
                       <div className="grid grid-cols-2 gap-4">
                         <div className="p-3 bg-kb-surface rounded-lg">
                           <div className="text-xs text-kb-muted mb-1">Avg Tempo</div>
                           <div className="text-lg font-semibold">
-                            {workout.analytics_summary.tempo.avg_ms.toFixed(0)}ms
+                            {(workout.analytics_summary.tempo.avg_seconds ?? 0).toFixed(1)}s
                           </div>
                         </div>
                         <div className="p-3 bg-kb-surface rounded-lg">
                           <div className="text-xs text-kb-muted mb-1">Consistency</div>
                           <div className="text-lg font-semibold">
-                            {(workout.analytics_summary.tempo.consistency * 100).toFixed(0)}%
+                            {((workout.analytics_summary.tempo.consistency ?? 0) * 100).toFixed(0)}%
                           </div>
                         </div>
                       </div>
                     )}
 
                     {/* Fatigue indicator */}
-                    {workout.analytics_summary.fatigue_indicator && (
+                    {workout.analytics_summary?.fatigue?.fatigue_detected && (
                       <div className="p-3 bg-kb-surface rounded-lg">
                         <div className="text-xs text-kb-muted mb-2">Fatigue Analysis</div>
                         <div className="flex items-center justify-between">
-                          <span className="text-sm">First 10 reps</span>
+                          <span className="text-sm">Overall Score</span>
                           <span
                             className={cn(
                               "font-medium",
-                              workout.analytics_summary.fatigue_indicator.first_10_valid_rate > 0.9
+                              (workout.analytics_summary.fatigue.fatigue_score ?? 0) < 0.3
                                 ? "text-kb-success"
                                 : "text-kb-warning"
                             )}
                           >
-                            {(workout.analytics_summary.fatigue_indicator.first_10_valid_rate * 100).toFixed(0)}% valid
+                            {((1 - (workout.analytics_summary.fatigue.fatigue_score ?? 0)) * 100).toFixed(0)}% fresh
                           </span>
                         </div>
-                        <div className="flex items-center justify-between mt-1">
-                          <span className="text-sm">Last 10 reps</span>
-                          <span
-                            className={cn(
-                              "font-medium",
-                              workout.analytics_summary.fatigue_indicator.last_10_valid_rate > 0.9
-                                ? "text-kb-success"
-                                : "text-kb-warning"
-                            )}
-                          >
-                            {(workout.analytics_summary.fatigue_indicator.last_10_valid_rate * 100).toFixed(0)}% valid
-                          </span>
-                        </div>
-                        {workout.analytics_summary.fatigue_indicator.degradation > 0.1 && (
+                        {(workout.analytics_summary.fatigue.fatigue_score ?? 0) > 0.3 && (
                           <div className="mt-2 text-xs text-kb-warning">
-                            ⚠️ Fatigue detected: form degraded by{" "}
-                            {(workout.analytics_summary.fatigue_indicator.degradation * 100).toFixed(0)}% in final reps
+                            ⚠️ Fatigue detected: form may have degraded
                           </div>
                         )}
                       </div>

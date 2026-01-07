@@ -14,14 +14,16 @@ interface RepCounterProps {
 }
 
 export function RepCounter({
-  totalAttempts,
-  validReps,
-  noReps,
-  ambiguousReps,
+  totalAttempts = 0,
+  validReps = 0,
+  noReps = 0,
+  ambiguousReps = 0,
   className,
   showPercentage = true,
 }: RepCounterProps) {
-  const validRate = totalAttempts > 0 ? (validReps / totalAttempts) * 100 : 0;
+  const safeTotal = totalAttempts ?? 0;
+  const safeValid = validReps ?? 0;
+  const validRate = safeTotal > 0 ? (safeValid / safeTotal) * 100 : 0;
 
   return (
     <div className={cn("grid grid-cols-2 lg:grid-cols-4 gap-4", className)}>

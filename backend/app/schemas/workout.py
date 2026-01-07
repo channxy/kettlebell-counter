@@ -100,6 +100,7 @@ class WorkoutDetailResponse(BaseModel):
     # User notes/log
     notes: Optional[str] = None
     perceived_effort: Optional[int] = None  # RPE 1-10
+    mood: Optional[str] = None  # How user felt: great, good, okay, tired, heavy
     
     # Analytics
     analytics_summary: Optional[Dict[str, Any]]

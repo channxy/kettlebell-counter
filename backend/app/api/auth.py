@@ -99,3 +99,19 @@ async def get_me(
     """Get current user profile."""
     return current_user
 
+
+@router.patch("/me", response_model=UserResponse)
+async def update_me(
+    full_name: str = None,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Update current user profile."""
+    if full_name is not None:
+        current_user.full_name = full_name
+    
+    await db.commit()
+    await db.refresh(current_user)
+    
+    return current_user
+

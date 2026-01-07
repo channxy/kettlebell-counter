@@ -11,17 +11,25 @@ import { cn, formatDuration, getLiftTypeLabel, getStatusColor } from "@/lib/util
 interface WorkoutCardProps {
   workout: Workout;
   index?: number;
+  selectable?: boolean;
+  selected?: boolean;
+  onSelect?: () => void;
 }
 
-function ProcessingTimer({ createdAt }: { createdAt: string }) {
+function ProcessingTimer({ startedAt }: { startedAt: string | null }) {
   const [elapsed, setElapsed] = useState("0:00");
 
   useEffect(() => {
+    // Only start timer if we have a start time
+    if (!startedAt) {
+      setElapsed("0:00");
+      return;
+    }
+
     // Parse timestamp - treat as UTC if no timezone specified
-    // Append 'Z' if no timezone info to indicate UTC
-    const timestamp = createdAt.includes('Z') || createdAt.includes('+') 
-      ? createdAt 
-      : createdAt + 'Z';
+    const timestamp = startedAt.includes('Z') || startedAt.includes('+') 
+      ? startedAt 
+      : startedAt + 'Z';
     const start = new Date(timestamp).getTime();
     
     const updateTimer = () => {
@@ -35,7 +43,7 @@ function ProcessingTimer({ createdAt }: { createdAt: string }) {
     updateTimer();
     const interval = setInterval(updateTimer, 1000);
     return () => clearInterval(interval);
-  }, [createdAt]);
+  }, [startedAt]);
 
   return (
     <div className="flex items-center gap-1.5 text-kb-warning">
@@ -45,11 +53,21 @@ function ProcessingTimer({ createdAt }: { createdAt: string }) {
   );
 }
 
-export function WorkoutCard({ workout, index = 0 }: WorkoutCardProps) {
+export function WorkoutCard({ workout, index = 0, selectable = false, selected = false, onSelect }: WorkoutCardProps) {
   const isProcessing = ["pending", "processing", "analyzing", "queued"].includes(
     workout.processing_status
   );
   const isFailed = workout.processing_status === "failed";
+
+  const handleClick = (e: React.MouseEvent) => {
+    if (selectable && onSelect) {
+      e.preventDefault();
+      onSelect();
+    }
+  };
+
+  const CardWrapper = selectable ? "div" : Link;
+  const cardProps = selectable ? { onClick: handleClick } : { href: `/workouts/${workout.id}` };
 
   return (
     <motion.div
@@ -57,11 +75,12 @@ export function WorkoutCard({ workout, index = 0 }: WorkoutCardProps) {
       animate={{ opacity: 1, y: 0 }}
       transition={{ delay: index * 0.05 }}
     >
-      <Link href={`/workouts/${workout.id}`}>
+      <CardWrapper {...cardProps as any}>
         <div
           className={cn(
             "card p-5 hover:border-kb-accent/50 transition-all cursor-pointer group",
-            isProcessing && "animate-pulse-slow"
+            isProcessing && "animate-pulse-slow",
+            selected && "border-kb-accent ring-2 ring-kb-accent/30"
           )}
         >
           {/* Header */}
@@ -96,7 +115,11 @@ export function WorkoutCard({ workout, index = 0 }: WorkoutCardProps) {
                       : "Analyzing reps..."}
                   </span>
                 </div>
-                <ProcessingTimer createdAt={workout.created_at} />
+                {/* Only show timer when actually processing, not when queued */}
+                {(workout.processing_status === "processing" || workout.processing_status === "analyzing") && 
+                  workout.processing_started_at && (
+                  <ProcessingTimer startedAt={workout.processing_started_at} />
+                )}
               </div>
               <div className="flex items-center gap-3">
                 <div className="flex-1 h-2 bg-kb-surface rounded-full overflow-hidden">
@@ -190,7 +213,7 @@ export function WorkoutCard({ workout, index = 0 }: WorkoutCardProps) {
             </div>
           )}
         </div>
-      </Link>
+      </CardWrapper>
     </motion.div>
   );
 }

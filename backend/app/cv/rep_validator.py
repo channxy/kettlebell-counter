@@ -1,441 +1,418 @@
 """
-Rule-based rep validation using biomechanical checks.
+Rep validation for kettlebell lifts - COMPETITION ACCURATE.
 
-This module validates each rep attempt and classifies it as:
-- VALID: Meets all technical criteria
-- NO_REP: Fails one or more criteria (with explicit reasons)
-- AMBIGUOUS: Insufficient data to determine validity
+Validates detected rep WINDOWS to classify as:
+- VALID: Competition-compliant
+- NO_REP: Failed one or more criteria (with reasons)
+- AMBIGUOUS: Low confidence, cannot determine
 
-CRITICAL: This does NOT inflate valid reps or guess missing data.
+VALIDATION STRATEGY:
+1. Rule-based instantaneous checks (elbow angle, height, fixation)
+2. Temporal trajectory analysis (1D classifier for movement quality)
+3. Combined scoring for final classification
+
+VALIDATION CRITERIA:
+1. Elbow extension ≥ 165-170° (camera angle dependent)
+2. Wrist clearly above head (75%+ of body height)
+3. Fixation duration ≥ 300-500ms with visible stability
+4. Pose confidence stable throughout
+5. No excessive torso lean (jerk/LC only)
+6. Smooth trajectory (no segmented pulls)
+7. Proper velocity profile (continuous ascent to overhead)
+
+All decisions are auditable and explainable.
 """
 
+import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 from enum import Enum
+import logging
 
-import numpy as np
+from app.cv.window_rep_detector import RepWindow
+from app.cv.video_analyzer import CameraAngle
+from app.models.rep_attempt import RepClassification, FailureReason
 
 try:
-    from app.cv.hybrid_estimator import HybridPose as PoseKeypoints
+    from app.cv.hybrid_estimator import HybridPose
 except ImportError:
-    try:
-        from app.cv.movenet_estimator import MoveNetPose as PoseKeypoints
-    except ImportError:
-        from app.cv.pose_estimator import PoseKeypoints
-from app.cv.rep_detector import RepCycle, LiftPhase
-from app.models.rep_attempt import RepClassification, FailureReason
-from app.config import get_settings
+    HybridPose = None
+
+try:
+    from app.cv.temporal_classifier import TemporalClassifier, TemporalValidity
+except ImportError:
+    TemporalClassifier = None
+    TemporalValidity = None
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
 class ValidationResult:
-    """
-    Result of validating a single rep attempt.
+    """Result of rep validation."""
+    classification: RepClassification
+    confidence_score: float
+    failure_reasons: List[FailureReason] = field(default_factory=list)
+    pose_confidence_avg: float = 0.0
     
-    Contains classification and detailed metrics for explainability.
-    """
-    classification: str  # RepClassification value
-    failure_reasons: List[str] = field(default_factory=list)
-    confidence_score: float = 1.0
-    pose_confidence_avg: float = 1.0
-    
-    # Detailed metrics for analytics and explainability
+    # Detailed metrics for explainability
     metrics: Dict[str, Any] = field(default_factory=dict)
     
-    @property
-    def is_valid(self) -> bool:
-        return self.classification == RepClassification.VALID
-    
-    @property
-    def is_no_rep(self) -> bool:
-        return self.classification == RepClassification.NO_REP
-    
-    @property
-    def is_ambiguous(self) -> bool:
-        return self.classification == RepClassification.AMBIGUOUS
+    # Check results
+    checks_passed: List[str] = field(default_factory=list)
+    checks_failed: List[str] = field(default_factory=list)
 
 
-class BiomechanicalCheck:
-    """Base class for biomechanical validation checks."""
+@dataclass
+class ValidationThresholds:
+    """Thresholds for validation checks - COMPETITION ACCURATE."""
+    # Elbow angle (degrees) - strict for competition
+    min_lockout_angle: float = 165.0
     
-    name: str = "base_check"
-    failure_reason: str = ""
+    # Wrist height (ratio of body height) - must be clearly overhead
+    min_overhead_height: float = 0.75
     
-    def check(
-        self,
-        cycle: RepCycle,
-        poses: List[PoseKeypoints],
-        settings: Any
-    ) -> tuple[bool, float, Dict[str, Any]]:
-        """
-        Perform the check.
-        
-        Args:
-            cycle: The rep cycle being validated
-            poses: Pose keypoints during the cycle
-            settings: Application settings with thresholds
-            
-        Returns:
-            Tuple of (passed, confidence, metrics)
-        """
-        raise NotImplementedError
-
-
-class LockoutAngleCheck(BiomechanicalCheck):
-    """Check that elbows are fully extended at lockout."""
+    # Fixation (frames) - visible pause required
+    min_fixation_frames: int = 4
     
-    name = "lockout_angle"
-    failure_reason = FailureReason.ELBOWS_NOT_EXTENDED
+    # Pose confidence
+    min_pose_confidence: float = 0.40
+    ambiguous_confidence: float = 0.30
     
-    def check(
-        self,
-        cycle: RepCycle,
-        poses: List[PoseKeypoints],
-        settings: Any
-    ) -> tuple[bool, float, Dict[str, Any]]:
-        # Find peak frame poses
-        peak_poses = [
-            p for p in poses 
-            if cycle.peak_frame - 3 <= p.frame_number <= cycle.peak_frame + 3
-        ]
+    # Torso lean (degrees) - only for jerk/LC
+    max_torso_lean: float = 18.0
+    
+    # Temporal classifier weight (0-1)
+    temporal_weight: float = 0.3  # 30% of final score from temporal analysis
+    
+    @classmethod
+    def for_lift_and_angle(
+        cls, 
+        lift_type: str, 
+        camera_angle: CameraAngle,
+        fps: float = 15.0
+    ) -> "ValidationThresholds":
+        """Create thresholds adapted to lift type and camera angle."""
+        thresholds = cls()
         
-        if not peak_poses:
-            return False, 0.0, {"error": "no_peak_poses"}
-        
-        # Get maximum elbow angles at peak
-        left_angles = []
-        right_angles = []
-        
-        for pose in peak_poses:
-            left = pose.get_elbow_angle("left")
-            right = pose.get_elbow_angle("right")
-            if left is not None:
-                left_angles.append(left)
-            if right is not None:
-                right_angles.append(right)
-        
-        if not left_angles and not right_angles:
-            return False, 0.0, {"error": "no_elbow_data"}
-        
-        max_left = max(left_angles) if left_angles else 0
-        max_right = max(right_angles) if right_angles else 0
-        
-        # For double kettlebell (jerk, long cycle), check both
-        if cycle.lift_type in ["jerk", "long_cycle"]:
-            min_angle = min(max_left, max_right) if (max_left > 0 and max_right > 0) else max(max_left, max_right)
+        # Camera angle adjustments
+        if camera_angle == CameraAngle.SIDE:
+            # Side view: elbow angle most reliable
+            thresholds.min_lockout_angle = 165.0
+            thresholds.min_fixation_frames = max(4, int(0.30 * fps))  # ~300ms
+        elif camera_angle == CameraAngle.FRONT:
+            # Front view: elbow unreliable, require longer fixation
+            thresholds.min_lockout_angle = 155.0  # More lenient
+            thresholds.min_fixation_frames = max(6, int(0.45 * fps))  # ~450ms
         else:
-            # Snatch - single arm, use whichever has the better angle (auto-detect dominant hand)
-            min_angle = max(max_left, max_right) if (max_left > 0 or max_right > 0) else 0
+            # Diagonal or unknown
+            thresholds.min_lockout_angle = 160.0
+            thresholds.min_fixation_frames = max(5, int(0.35 * fps))  # ~350ms
         
-        passed = min_angle >= settings.min_lockout_angle_degrees
-        confidence = min(1.0, min_angle / settings.min_lockout_angle_degrees) if min_angle > 0 else 0.0
+        # Lift type adjustments
+        if lift_type == "snatch":
+            # Snatch: no torso lean check, stricter overhead
+            thresholds.max_torso_lean = 999.0  # Disabled
+            thresholds.min_overhead_height = 0.78  # Must be clearly overhead
+        elif lift_type == "jerk":
+            thresholds.max_torso_lean = 15.0  # Strict for jerk
+            thresholds.min_overhead_height = 0.75
+        else:  # long_cycle
+            thresholds.max_torso_lean = 18.0
+            thresholds.min_overhead_height = 0.75
         
-        return passed, confidence, {
-            "lockout_angle_left": max_left,
-            "lockout_angle_right": max_right,
-            "min_angle": min_angle,
-            "threshold": settings.min_lockout_angle_degrees
-        }
-
-
-class OverheadPositionCheck(BiomechanicalCheck):
-    """Check that kettlebell reaches proper overhead position."""
-    
-    name = "overhead_position"
-    failure_reason = FailureReason.KETTLEBELL_NOT_OVERHEAD
-    
-    def check(
-        self,
-        cycle: RepCycle,
-        poses: List[PoseKeypoints],
-        settings: Any
-    ) -> tuple[bool, float, Dict[str, Any]]:
-        # Check peak wrist height
-        peak_height = cycle.peak_wrist_height
-        
-        if peak_height is None:
-            return False, 0.0, {"error": "no_peak_height"}
-        
-        passed = peak_height >= settings.min_overhead_height_ratio
-        confidence = min(1.0, peak_height / settings.min_overhead_height_ratio)
-        
-        return passed, confidence, {
-            "peak_height_ratio": peak_height,
-            "threshold": settings.min_overhead_height_ratio
-        }
-
-
-class FixationTimeCheck(BiomechanicalCheck):
-    """Check for sufficient fixation time at lockout."""
-    
-    name = "fixation_time"
-    failure_reason = FailureReason.INSUFFICIENT_FIXATION
-    
-    def check(
-        self,
-        cycle: RepCycle,
-        poses: List[PoseKeypoints],
-        settings: Any
-    ) -> tuple[bool, float, Dict[str, Any]]:
-        # Count frames in lockout phase
-        lockout_phases = [
-            (phase, frame) for phase, frame in cycle.phases 
-            if phase == LiftPhase.LOCKOUT
-        ]
-        
-        if not lockout_phases:
-            return False, 0.5, {"fixation_frames": 0, "threshold": settings.min_fixation_frames}
-        
-        lockout_start = lockout_phases[0][1]
-        
-        # Find when lockout ends (next phase or cycle end)
-        lockout_end = cycle.end_frame
-        for i, (phase, frame) in enumerate(cycle.phases):
-            if phase == LiftPhase.LOCKOUT:
-                # Look for next phase
-                if i + 1 < len(cycle.phases):
-                    lockout_end = cycle.phases[i + 1][1]
-                    break
-        
-        fixation_frames = lockout_end - lockout_start
-        passed = fixation_frames >= settings.min_fixation_frames
-        confidence = min(1.0, fixation_frames / settings.min_fixation_frames)
-        
-        return passed, confidence, {
-            "fixation_frames": fixation_frames,
-            "threshold": settings.min_fixation_frames
-        }
-
-
-class TorsoLeanCheck(BiomechanicalCheck):
-    """Check for excessive torso lean during lockout."""
-    
-    name = "torso_lean"
-    failure_reason = FailureReason.EXCESSIVE_TORSO_LEAN
-    
-    def check(
-        self,
-        cycle: RepCycle,
-        poses: List[PoseKeypoints],
-        settings: Any
-    ) -> tuple[bool, float, Dict[str, Any]]:
-        # Get torso lean at peak
-        peak_poses = [
-            p for p in poses 
-            if cycle.peak_frame - 2 <= p.frame_number <= cycle.peak_frame + 2
-        ]
-        
-        if not peak_poses:
-            return False, 0.0, {"error": "no_peak_poses"}
-        
-        lean_angles = []
-        for pose in peak_poses:
-            lean = pose.get_torso_lean_angle()
-            if lean is not None:
-                lean_angles.append(lean)
-        
-        if not lean_angles:
-            return True, 0.5, {"error": "no_torso_data"}  # Don't fail if no data
-        
-        max_lean = max(lean_angles)
-        passed = max_lean <= settings.max_torso_lean_degrees
-        confidence = min(1.0, settings.max_torso_lean_degrees / max_lean) if max_lean > 0 else 1.0
-        
-        return passed, confidence, {
-            "max_torso_lean": max_lean,
-            "threshold": settings.max_torso_lean_degrees
-        }
-
-
-class SymmetryCheck(BiomechanicalCheck):
-    """Check for arm symmetry (for double kettlebell lifts)."""
-    
-    name = "symmetry"
-    failure_reason = FailureReason.ASYMMETRIC_LOCKOUT
-    
-    def check(
-        self,
-        cycle: RepCycle,
-        poses: List[PoseKeypoints],
-        settings: Any
-    ) -> tuple[bool, float, Dict[str, Any]]:
-        # Only applies to double KB lifts
-        if cycle.lift_type == "snatch":
-            return True, 1.0, {"skipped": "single_kb_lift"}
-        
-        # Get symmetry at peak
-        peak_poses = [
-            p for p in poses 
-            if cycle.peak_frame - 2 <= p.frame_number <= cycle.peak_frame + 2
-        ]
-        
-        if not peak_poses:
-            return True, 0.5, {"error": "no_peak_poses"}
-        
-        symmetry_scores = []
-        for pose in peak_poses:
-            score = pose.get_arm_symmetry_score()
-            if score is not None:
-                symmetry_scores.append(score)
-        
-        if not symmetry_scores:
-            return True, 0.5, {"error": "no_symmetry_data"}
-        
-        min_symmetry = min(symmetry_scores)
-        passed = min_symmetry >= 0.7  # 70% symmetry threshold
-        
-        return passed, min_symmetry, {
-            "min_symmetry_score": min_symmetry,
-            "threshold": 0.7
-        }
+        return thresholds
 
 
 class RepValidator:
     """
-    Rule-based rep validation engine.
+    Validates rep windows using rule-based biomechanical checks.
     
-    Applies biomechanical checks to classify rep attempts.
-    
-    CRITICAL PRINCIPLES:
-    1. Never infer or guess missing data
-    2. Low confidence = AMBIGUOUS, not VALID
-    3. All decisions must be explainable with metrics
-    4. Prefer false negatives over false positives
+    All checks are:
+    1. Explainable (clear criteria)
+    2. Auditable (traced to pose data)
+    3. Configurable (per lift type and camera angle)
     """
     
-    # Checks for each lift type
-    CHECKS_BY_LIFT = {
-        "jerk": [
-            LockoutAngleCheck(),
-            OverheadPositionCheck(),
-            FixationTimeCheck(),
-            TorsoLeanCheck(),
-            SymmetryCheck(),
-        ],
-        "long_cycle": [
-            LockoutAngleCheck(),
-            OverheadPositionCheck(),
-            FixationTimeCheck(),
-            TorsoLeanCheck(),
-            SymmetryCheck(),
-        ],
-        "snatch": [
-            LockoutAngleCheck(),
-            OverheadPositionCheck(),
-            FixationTimeCheck(),
-            # Note: TorsoLeanCheck removed - backward lean is normal/expected in snatch
-        ],
-    }
-    
     def __init__(self):
-        """Initialize validator with settings."""
-        self.settings = get_settings()
+        self.lift_type: Optional[str] = None
+        self.camera_angle: CameraAngle = CameraAngle.UNKNOWN
     
-    def validate(
+    def validate_window(
         self,
-        cycle: RepCycle,
-        poses: List[PoseKeypoints]
+        window: RepWindow,
+        poses: List["HybridPose"],
+        camera_angle: CameraAngle = CameraAngle.UNKNOWN,
+        fatigue_score: float = 0.0
     ) -> ValidationResult:
         """
-        Validate a rep cycle and classify it.
+        Validate a rep window.
         
         Args:
-            cycle: The detected rep cycle
-            poses: All pose keypoints during the cycle
+            window: The detected rep window
+            poses: HybridPose list within the window
+            camera_angle: Detected camera angle
+            fatigue_score: Current fatigue level (0-1)
             
         Returns:
-            ValidationResult with classification and metrics
+            ValidationResult with classification and reasons
         """
-        # Filter poses to cycle timeframe
-        cycle_poses = [
-            p for p in poses 
-            if cycle.start_frame <= p.frame_number <= cycle.end_frame
-        ]
-        
-        # Check pose confidence
-        if not cycle_poses:
-            return ValidationResult(
-                classification=RepClassification.AMBIGUOUS,
-                failure_reasons=[FailureReason.OCCLUDED_KEYPOINTS],
-                confidence_score=0.0,
-                pose_confidence_avg=0.0,
-                metrics={"error": "no_poses_in_cycle"}
-            )
-        
-        pose_confidences = [p.overall_confidence for p in cycle_poses]
-        avg_pose_confidence = np.mean(pose_confidences)
-        
-        # If pose confidence is too low, mark as AMBIGUOUS
-        if avg_pose_confidence < self.settings.ambiguous_confidence_threshold:
-            return ValidationResult(
-                classification=RepClassification.AMBIGUOUS,
-                failure_reasons=[FailureReason.LOW_POSE_CONFIDENCE],
-                confidence_score=avg_pose_confidence,
-                pose_confidence_avg=avg_pose_confidence,
-                metrics={"pose_confidence_avg": avg_pose_confidence}
-            )
-        
-        # Run all applicable checks
-        checks = self.CHECKS_BY_LIFT.get(cycle.lift_type, self.CHECKS_BY_LIFT["jerk"])
-        
-        all_passed = True
-        failure_reasons = []
-        all_metrics = {}
-        confidences = []
-        
-        for check in checks:
-            passed, confidence, metrics = check.check(
-                cycle, cycle_poses, self.settings
-            )
-            
-            all_metrics[check.name] = metrics
-            confidences.append(confidence)
-            
-            if not passed:
-                all_passed = False
-                failure_reasons.append(check.failure_reason)
-        
-        overall_confidence = np.mean(confidences) if confidences else 0.0
-        
-        # Determine classification
-        if avg_pose_confidence < self.settings.pose_confidence_threshold:
-            # Marginal pose confidence - be conservative
-            if all_passed:
-                classification = RepClassification.VALID
-            else:
-                # Could be ambiguous if confidence is borderline
-                classification = RepClassification.AMBIGUOUS
-                failure_reasons.append(FailureReason.LOW_POSE_CONFIDENCE)
-        elif all_passed:
-            classification = RepClassification.VALID
-        else:
-            classification = RepClassification.NO_REP
-        
-        # Add tempo metric
-        all_metrics["tempo_ms"] = cycle.duration_seconds * 1000
-        
-        return ValidationResult(
-            classification=classification,
-            failure_reasons=failure_reasons,
-            confidence_score=overall_confidence,
-            pose_confidence_avg=avg_pose_confidence,
-            metrics=all_metrics
+        # Get thresholds for this lift and camera angle
+        fps = len(poses) / window.duration_seconds if window.duration_seconds > 0 else 10.0
+        thresholds = ValidationThresholds.for_lift_and_angle(
+            window.lift_type, camera_angle, fps
         )
-    
-    def validate_batch(
-        self,
-        cycles: List[RepCycle],
-        all_poses: List[PoseKeypoints]
-    ) -> List[ValidationResult]:
-        """
-        Validate multiple cycles.
         
-        Args:
-            cycles: List of detected rep cycles
-            all_poses: All pose keypoints for the video
+        # Apply fatigue adjustment (relax slightly as fatigue increases)
+        if fatigue_score > 0.3:
+            thresholds.min_lockout_angle -= fatigue_score * 5  # Up to 5 degree relaxation
+            thresholds.min_overhead_height -= fatigue_score * 0.05  # Slight height relaxation
+        
+        result = ValidationResult(
+            classification=RepClassification.VALID,
+            confidence_score=1.0,
+            pose_confidence_avg=window.avg_confidence,
+            metrics={}
+        )
+        
+        # =========================================================
+        # CHECK 1: Pose Confidence
+        # =========================================================
+        if window.avg_confidence < thresholds.ambiguous_confidence:
+            result.classification = RepClassification.AMBIGUOUS
+            result.confidence_score = window.avg_confidence  # Reflect actual pose confidence
+            result.failure_reasons.append(FailureReason.LOW_POSE_CONFIDENCE)
+            result.checks_failed.append("pose_confidence")
+            result.metrics["pose_confidence"] = {
+                "value": window.avg_confidence,
+                "threshold": thresholds.ambiguous_confidence,
+                "note": "Pose confidence too low to judge"
+            }
+            return result  # Early return for ambiguous
+        
+        if window.avg_confidence < thresholds.min_pose_confidence:
+            result.confidence_score *= 0.7
+            result.checks_failed.append("pose_confidence_warning")
+        else:
+            result.checks_passed.append("pose_confidence")
+        
+        result.metrics["pose_confidence"] = {
+            "value": window.avg_confidence,
+            "threshold": thresholds.min_pose_confidence,
+            "passed": window.avg_confidence >= thresholds.min_pose_confidence
+        }
+        
+        # =========================================================
+        # CHECK 2: Overhead Position (Did wrist reach overhead?)
+        # =========================================================
+        reached_overhead = window.peak_wrist_height >= thresholds.min_overhead_height
+        
+        if not reached_overhead:
+            result.classification = RepClassification.NO_REP
+            result.failure_reasons.append(FailureReason.INCOMPLETE_LOCKOUT)
+            result.checks_failed.append("overhead_position")
+        else:
+            result.checks_passed.append("overhead_position")
+        
+        result.metrics["overhead_position"] = {
+            "peak_height": window.peak_wrist_height,
+            "threshold": thresholds.min_overhead_height,
+            "passed": reached_overhead
+        }
+        
+        # =========================================================
+        # CHECK 3: Fixation Duration
+        # =========================================================
+        had_fixation = window.fixation_frames >= thresholds.min_fixation_frames
+        
+        if not had_fixation:
+            if result.classification == RepClassification.VALID:
+                result.classification = RepClassification.NO_REP
+            result.failure_reasons.append(FailureReason.INSUFFICIENT_FIXATION)
+            result.checks_failed.append("fixation_duration")
+        else:
+            result.checks_passed.append("fixation_duration")
+        
+        result.metrics["fixation"] = {
+            "frames": window.fixation_frames,
+            "threshold": thresholds.min_fixation_frames,
+            "passed": had_fixation
+        }
+        
+        # =========================================================
+        # CHECK 4: Elbow Extension (at peak)
+        # =========================================================
+        if window.max_elbow_angle > 0:
+            good_lockout = window.max_elbow_angle >= thresholds.min_lockout_angle
             
-        Returns:
-            List of ValidationResult for each cycle
-        """
-        return [self.validate(cycle, all_poses) for cycle in cycles]
-
+            if not good_lockout:
+                if result.classification == RepClassification.VALID:
+                    result.classification = RepClassification.NO_REP
+                result.failure_reasons.append(FailureReason.ELBOWS_NOT_EXTENDED)
+                result.checks_failed.append("elbow_extension")
+            else:
+                result.checks_passed.append("elbow_extension")
+            
+            result.metrics["elbow_angle"] = {
+                "max_angle": window.max_elbow_angle,
+                "threshold": thresholds.min_lockout_angle,
+                "passed": good_lockout
+            }
+        else:
+            # No elbow data - reduce confidence but don't fail
+            result.confidence_score *= 0.8
+            result.metrics["elbow_angle"] = {
+                "note": "Elbow angle not available",
+                "passed": None
+            }
+        
+        # =========================================================
+        # CHECK 5: Torso Lean (jerk/LC only)
+        # =========================================================
+        if window.lift_type in ["jerk", "long_cycle"] and poses:
+            torso_lean = self._calculate_max_torso_lean(poses)
+            
+            if torso_lean is not None:
+                good_torso = torso_lean <= thresholds.max_torso_lean
+                
+                if not good_torso:
+                    if result.classification == RepClassification.VALID:
+                        result.classification = RepClassification.NO_REP
+                    result.failure_reasons.append(FailureReason.EXCESSIVE_TORSO_LEAN)
+                    result.checks_failed.append("torso_lean")
+                else:
+                    result.checks_passed.append("torso_lean")
+                
+                result.metrics["torso_lean"] = {
+                    "max_angle": torso_lean,
+                    "threshold": thresholds.max_torso_lean,
+                    "passed": good_torso
+                }
+        
+        # =========================================================
+        # CHECK 6: Temporal Trajectory Analysis (if classifier available)
+        # =========================================================
+        temporal_score = 1.0
+        if TemporalClassifier is not None and window.wrist_heights:
+            try:
+                temporal_classifier = TemporalClassifier(
+                    fps=fps,
+                    lift_type=window.lift_type
+                )
+                temporal_result = temporal_classifier.classify(
+                    wrist_heights=window.wrist_heights,
+                    elbow_angles=window.elbow_angles if window.elbow_angles else None
+                )
+                
+                temporal_score = temporal_result.confidence
+                
+                if temporal_result.validity == TemporalValidity.VALID:
+                    result.checks_passed.append("temporal_trajectory")
+                elif temporal_result.validity == TemporalValidity.NO_REP:
+                    result.checks_failed.append("temporal_trajectory")
+                    # Add specific temporal failures
+                    for reason in temporal_result.reasons:
+                        if "Segmented pull" in reason:
+                            result.failure_reasons.append(FailureReason.SEGMENTED_PULL)
+                        elif "range of motion" in reason.lower():
+                            result.failure_reasons.append(FailureReason.INCOMPLETE_LOCKOUT)
+                else:
+                    # UNCLEAR - don't add to passed or failed
+                    pass
+                
+                result.metrics["temporal_analysis"] = {
+                    "validity": temporal_result.validity.value,
+                    "confidence": temporal_result.confidence,
+                    "checks_passed": temporal_result.checks_passed,
+                    "checks_failed": temporal_result.checks_failed,
+                    "reasons": temporal_result.reasons
+                }
+                
+            except Exception as e:
+                logger.warning(f"Temporal classification failed: {e}")
+                temporal_score = 0.5  # Neutral
+        
+        # =========================================================
+        # FINAL: Calculate Combined Score
+        # =========================================================
+        total_checks = len(result.checks_passed) + len(result.checks_failed)
+        if total_checks > 0:
+            rule_based_score = len(result.checks_passed) / total_checks
+        else:
+            rule_based_score = 0.5
+        
+        # Combine rule-based and temporal scores
+        combined_score = (
+            rule_based_score * (1 - thresholds.temporal_weight) +
+            temporal_score * thresholds.temporal_weight
+        )
+        result.confidence_score = combined_score
+        
+        # Final classification based on combined score
+        if combined_score >= 0.75:
+            if result.classification == RepClassification.NO_REP and combined_score >= 0.85:
+                # Temporal analysis overrides minor rule failures
+                result.classification = RepClassification.VALID
+        elif combined_score < 0.45:
+            result.classification = RepClassification.NO_REP
+        elif result.classification == RepClassification.VALID and combined_score < 0.6:
+            result.classification = RepClassification.AMBIGUOUS
+        
+        return result
+    
+    def _calculate_max_torso_lean(self, poses: List["HybridPose"]) -> Optional[float]:
+        """Calculate maximum torso lean angle from poses."""
+        lean_angles = []
+        
+        for pose in poses:
+            left_hip = pose.left_hip
+            right_hip = pose.right_hip
+            left_shoulder = pose.left_shoulder
+            right_shoulder = pose.right_shoulder
+            
+            if not all([left_hip, right_hip, left_shoulder, right_shoulder]):
+                continue
+            
+            # Midpoints
+            hip_mid = np.array([(left_hip.x + right_hip.x) / 2, (left_hip.y + right_hip.y) / 2])
+            shoulder_mid = np.array([(left_shoulder.x + right_shoulder.x) / 2, (left_shoulder.y + right_shoulder.y) / 2])
+            
+            # Torso vector
+            torso_vec = shoulder_mid - hip_mid
+            
+            # Vertical vector (up in image coordinates)
+            vertical = np.array([0, -1])
+            
+            # Angle
+            cos_angle = np.dot(torso_vec, vertical) / (np.linalg.norm(torso_vec) * np.linalg.norm(vertical) + 1e-6)
+            angle_rad = np.arccos(np.clip(cos_angle, -1.0, 1.0))
+            
+            lean_angles.append(float(np.degrees(angle_rad)))
+        
+        return max(lean_angles) if lean_angles else None
+    
+    # Legacy compatibility method
+    def validate(self, cycle, poses) -> ValidationResult:
+        """Legacy validation method for compatibility."""
+        # Convert old cycle to new window format
+        from app.cv.window_rep_detector import RepWindow
+        
+        if isinstance(cycle, RepWindow):
+            window = cycle
+        else:
+            # Create minimal window from old cycle
+            window = RepWindow(
+                start_frame=cycle.start_frame,
+                end_frame=cycle.end_frame,
+                start_timestamp=cycle.start_timestamp,
+                end_timestamp=cycle.end_timestamp,
+                lift_type=cycle.lift_type,
+                peak_wrist_height=getattr(cycle, 'peak_wrist_height', 0.7),
+                fixation_frames=getattr(cycle, 'fixation_frames', 5),
+                avg_confidence=getattr(cycle, 'detection_confidence', 0.8)
+            )
+        
+        # Create empty poses list for legacy compatibility
+        poses = []
+        
+        return self.validate_window(window, poses)

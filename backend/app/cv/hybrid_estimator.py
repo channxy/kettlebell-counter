@@ -196,7 +196,7 @@ class HybridPose:
         cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-6)
         angle_rad = np.arccos(np.clip(cos_angle, -1.0, 1.0))
         
-        return np.degrees(angle_rad)
+        return float(np.degrees(angle_rad))
     
     def is_in_fixation(self, side: str = "left", min_stable_frames: int = 3) -> bool:
         """Check if wrist is in stable fixation position."""
